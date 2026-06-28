@@ -1,4 +1,4 @@
-package com.myname.mymodid;
+package com.mofoga.gtworkstation;
 
 public class ClientProxy extends CommonProxy {
 

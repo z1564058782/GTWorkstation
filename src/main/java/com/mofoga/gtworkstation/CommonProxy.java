@@ -1,5 +1,6 @@
-package com.myname.mymodid;
+package com.mofoga.gtworkstation;
 
+import com.myname.mymodid.Tags;
 import cpw.mods.fml.common.event.FMLInitializationEvent;
 import cpw.mods.fml.common.event.FMLPostInitializationEvent;
 import cpw.mods.fml.common.event.FMLPreInitializationEvent;
