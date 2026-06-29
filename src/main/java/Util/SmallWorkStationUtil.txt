@@ -1,0 +1,120 @@
+/**
+ * 小型工作站工具类
+ * 提供模块槽位计算、电机层级转换等通用功能
+ *
+ * @author WorkStation Team
+ */
+public class SmallWorkStationUtil {
+
+    /**
+     * 每个电机层级对应的可用模块槽位数量
+     * 小型工作站固定 4 个模块槽位，电机层级仅影响模块可用的功能等级
+     * 索引 0 对应电机层级 1
+     */
+    private static final int[] AVAILABLE_MODULE_SLOTS = { 2, 3, 4, 4, 4, 4 };
+
+    /**
+     * 根据电机层级获取已解锁的模块槽位数量
+     *
+     * @param motorTier 当前电机层级（从 1 开始）
+     * @return 已解锁的模块槽位数量，如果层级无效则返回 0
+     */
+    public static int getModuleSlotsUnlocked(int motorTier) {
+        // 验证电机层级是否在有效范围内
+        if (motorTier < 1 || motorTier > AVAILABLE_MODULE_SLOTS.length) {
+            return 0;
+        }
+        // 返回对应层级的槽位数量（数组索引从 0 开始，层级从 1 开始）
+        return AVAILABLE_MODULE_SLOTS[motorTier - 1];
+    }
+
+    /**
+     * 获取层级化电机方块列表
+     * 每个 Pair 包含电机方块及其元数据，元数据对应电机层级
+     *
+     * @return 电机层级方块列表（不可变）
+     */
+    public static List<Pair<Block, Integer>> getMotorTiers() {
+        return ImmutableList.of(
+            Pair.of(GregTechAPI.sBlockCasingsSEMotor, 0), // 电机层级 1
+            Pair.of(GregTechAPI.sBlockCasingsSEMotor, 1), // 电机层级 2
+            Pair.of(GregTechAPI.sBlockCasingsSEMotor, 2), // 电机层级 3
+            Pair.of(GregTechAPI.sBlockCasingsSEMotor, 3), // 电机层级 4
+            Pair.of(GregTechAPI.sBlockCasingsSEMotor, 4), // 电机层级 5
+            Pair.of(GregTechAPI.sBlockCasingsSEMotor, 5)); // 电机层级 6
+    }
+
+    /**
+     * 获取电机层级转换器，根据方块和元数据返回对应的电机层级
+     *
+     * @return 电机层级转换器
+     */
+    public static com.gtnewhorizon.structurelib.structure.ITierConverter<Integer> motorTierConverter() {
+        return (block, meta) -> {
+            // 如果方块为空，返回无效层级
+            if (block == null) {
+                return -1;
+            } else if (block == GregTechAPI.sBlockCasingsSEMotor) {
+                // 电机方块的元数据 + 1 = 电机层级
+                return meta + 1;
+            }
+            return -1;
+        };
+    }
+
+    /**
+     * 小型工作站项目模块仓口元素枚举
+     * 用于在工作站结构中注册模块类型的仓口
+     *
+     * @author WorkStation Team
+     */
+    public enum ProjectModuleElement implements IHatchElement<TileEntitySmallWorkStation> {
+
+        /** 项目模块仓口，对应 TileEntitySmallWorkStationModuleBase 类型 */
+        ProjectModule(TileEntitySmallWorkStation::addProjectModuleToMachineList,
+            TileEntitySmallWorkStationModuleBase.class) {
+
+            /**
+             * 统计当前工作站中已安装的项目模块数量
+             */
+            @Override
+            public long count(TileEntitySmallWorkStation tileEntity) {
+                return tileEntity.mProjectModuleHatches.size();
+            }
+        };
+
+        /** 该仓口元素对应的 MTE 类列表 */
+        private final List<Class<? extends IMetaTileEntity>> mteClasses;
+        /** 该仓口元素的添加器 */
+        private final IGTHatchAdder<TileEntitySmallWorkStation> adder;
+
+        /**
+         * 构造项目模块仓口元素
+         *
+         * @param adder      仓口添加器
+         * @param mteClasses 对应的 MTE 类
+         */
+        @SafeVarargs
+        ProjectModuleElement(IGTHatchAdder<TileEntitySmallWorkStation> adder,
+            Class<? extends IMetaTileEntity>... mteClasses) {
+            this.mteClasses = Collections.unmodifiableList(Arrays.asList(mteClasses));
+            this.adder = adder;
+        }
+
+        /**
+         * @return 该仓口元素对应的 MTE 类列表
+         */
+        @Override
+        public List<? extends Class<? extends IMetaTileEntity>> mteClasses() {
+            return mteClasses;
+        }
+
+        /**
+         * @return 该仓口元素的添加器
+         */
+        @Override
+        public IGTHatchAdder<? super TileEntitySmallWorkStation> adder() {
+            return adder;
+        }
+    }
+}

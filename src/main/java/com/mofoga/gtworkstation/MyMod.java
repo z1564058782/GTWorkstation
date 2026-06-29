@@ -1,5 +1,6 @@
 package com.mofoga.gtworkstation;
 
+import Loader.CraftingLoader;
 import Loader.ItemLoader;
 import com.myname.mymodid.Tags;
 import org.apache.logging.log4j.LogManager;
@@ -11,6 +12,8 @@ import cpw.mods.fml.common.event.FMLInitializationEvent;
 import cpw.mods.fml.common.event.FMLPostInitializationEvent;
 import cpw.mods.fml.common.event.FMLPreInitializationEvent;
 import cpw.mods.fml.common.event.FMLServerStartingEvent;
+
+import static Loader.MachineLoader.loaderMachines;
 
 @Mod(modid = MyMod.MODID, version = Tags.VERSION, name = "GTWorkstation", acceptedMinecraftVersions = "[1.7.10]")
 public class MyMod {
@@ -25,13 +28,15 @@ public class MyMod {
     // preInit "Run before anything else. Read your config, create blocks, items, etc, and register them with the
     // GameRegistry." (Remove if not needed)
     public void preInit(FMLPreInitializationEvent event) {
-        new ItemLoader(event);
         proxy.preInit(event);
     }
 
     @Mod.EventHandler
     // load "Do your mod setup. Build whatever data structures you care about. Register recipes." (Remove if not needed)
     public void init(FMLInitializationEvent event) {
+
+        loaderMachines();
+        new CraftingLoader();
         proxy.init(event);
     }
 

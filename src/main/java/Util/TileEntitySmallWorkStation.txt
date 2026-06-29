@@ -1,0 +1,673 @@
+/**
+ * 小型工作站多方块结构控制器
+ *
+ * 结构布局（9×1×9 平面，俯视图）：
+ * <pre>
+ *   M C C C C C C C M     M = 模块位置（3×3×3 模块位于此处）
+ *   C C C C C C C C C     C = 基础外壳
+ *   C C C C C C C C C     ~ = 控制器位置（中心）
+ *   C C C C C C C C C
+ *   C C C C ~ C C C C     四个角各有一个 3×3×3 的模块
+ *   C C C C C C C C C
+ *   C C C C C C C C C
+ *   C C C C C C C C C
+ *   M C C C C C C C M
+ * </pre>
+ *
+ * 最多支持 4 个模块槽位，电机层级 1-6 分别解锁 2/3/4/4/4/4 个槽位。
+ * 模块能量由小型工作站内部缓冲统一分配（每 20 tick）。
+ *
+ * @author WorkStation Team
+ */
+public class TileEntitySmallWorkStation extends TTMultiblockBase implements ISurvivalConstructable, INEIPreviewModifier {
+
+    // ==================== 模块管理 ====================
+
+    /** 小型工作站中安装的项目模块列表 */
+    public ArrayList<TileEntitySmallWorkStationModuleBase> mProjectModuleHatches = new ArrayList<>();
+
+    /** 当前电机层级，决定可用的模块槽位数量 */
+    protected int motorTier = 0;
+
+    /**
+     * 获取小型工作站的输入仓口列表
+     *
+     * @return 输入仓口列表
+     */
+    public List<MTEHatchInput> getSmallWorkStationInputHatches() {
+        return mInputHatches;
+    }
+
+    /**
+     * 获取可供模块使用的数据量
+     * 数据在活跃模块之间平均分配
+     *
+     * @return 每个模块可用的数据量
+     */
+    public long getAvailableDataForModules() {
+        if (mProjectModuleHatches == null || mProjectModuleHatches.isEmpty()) {
+            return getAvailableData_EM();
+        }
+
+        // 统计活跃模块数量
+        long activeModuleAmount = mProjectModuleHatches.stream()
+            .filter(
+                module -> module.getBaseMetaTileEntity() != null
+                    && module.getBaseMetaTileEntity()
+                        .isActive()
+                    && module.isDataInputListEmpty())
+            .count();
+        if (activeModuleAmount == 0) {
+            return getAvailableData_EM();
+        }
+        // 在活跃模块之间平均分配数据
+        return getAvailableData_EM() / activeModuleAmount;
+    }
+
+    // ==================== 常量定义 ====================
+
+    /** 模块充能间隔（tick），每 20 tick 为模块分配一次能量 */
+    private static final int MODULE_CHARGE_INTERVAL = 20;
+    /** 内部 EU 缓冲倍数，决定小型工作站可存储的能量总量 */
+    private static final int INTERNAL_BUFFER_MULTIPLIER = 4;
+
+    /** 小型工作站基础外壳的纹理索引 */
+    public static final int CASING_INDEX_BASE = 32 * 128;
+
+    // ==================== 结构定义常量 ====================
+
+    /** 主结构部件的名称 */
+    private static final String STRUCTURE_PIECE_MAIN = "main";
+
+    /** 贡献者子窗口的 ID */
+    private static final int CONTRIBUTORS_WINDOW_ID = 10;
+
+    /** 主结构的水平偏移量（X 方向） */
+    private static final int STRUCTURE_OFFSET_X = 4;
+    /** 主结构的垂直偏移量（Y 方向，0 表示控制器所在层） */
+    private static final int STRUCTURE_OFFSET_Y = 0;
+    /** 主结构的深度偏移量（Z 方向） */
+    private static final int STRUCTURE_OFFSET_Z = 4;
+
+    // spotless:off
+    /**
+     * 小型工作站的结构定义
+     *
+     * 9×1×9 平面布局：
+     * - M：模块仓口位置（四个角），每个模块自身为 3×3×3 结构
+     * - C：基础外壳（GregTechAPI.sBlockCasingsSE）
+     * - ~：控制器位置（中心，坐标为 4,0,4）
+     * - F：框架（钨钢框架，可选用于结构完整性）
+     *
+     * 模块的 3×3×3 结构由各模块自身的 STRUCTURE_DEFINITION 定义，
+     * 在 checkMachine 时通过 checkPiece 验证。
+     */
+    private static final IStructureDefinition<TileEntitySmallWorkStation> STRUCTURE_DEFINITION =
+        StructureDefinition.<TileEntitySmallWorkStation>builder()
+            .addShape(STRUCTURE_PIECE_MAIN, new String[][] {
+                // 9×1×9 平面，仅 1 层高
+                // 每行 9 个字符，共 9 行
+                {
+                    "MCCCCCCCM", // 第 0 行：角模块 + 外壳
+                    "CCCCCCCCC", // 第 1 行：全部外壳
+                    "CCCCCCCCC", // 第 2 行：全部外壳
+                    "CCCCCCCCC", // 第 3 行：全部外壳
+                    "CCCC~CCCC", // 第 4 行：中心为控制器 ~
+                    "CCCCCCCCC", // 第 5 行：全部外壳
+                    "CCCCCCCCC", // 第 6 行：全部外壳
+                    "CCCCCCCCC", // 第 7 行：全部外壳
+                    "MCCCCCCCM"  // 第 8 行：角模块 + 外壳
+                }
+            })
+            .addElement(
+                'C',
+                StructureUtility.ofChain(
+                    // 仓口构建器：在 C 位置允许放置维护/输入总线/输出/能量仓口
+                    HatchElementBuilder.<TileEntitySmallWorkStation>builder()
+                        .atLeast(
+                            gregtech.api.enums.HatchElement.Maintenance,
+                            gregtech.api.enums.HatchElement.InputBus,
+                            gregtech.api.enums.HatchElement.OutputHatch,
+                            gregtech.api.enums.HatchElement.Energy)
+                        .adder(TileEntitySmallWorkStation::addToMachineList)
+                        .hatchClasses(Arrays.asList(
+                            gregtech.api.metatileentity.implementations.MTEHatchMaintenance.class,
+                            gregtech.api.metatileentity.implementations.MTEHatchInputBus.class,
+                            gregtech.api.metatileentity.implementations.MTEHatchOutput.class,
+                            gregtech.api.metatileentity.implementations.MTEHatchEnergy.class))
+                        .hint(1)
+                        .casingIndex(CASING_INDEX_BASE)
+                        .build(),
+                    // 基础外壳方块
+                    StructureUtility.ofBlock(GregTechAPI.sBlockCasingsSE, 0)))
+            .addElement(
+                'M',
+                StructureUtility.ofChain(
+                    // 模块仓口构建器：在 M 位置允许放置模块类型的仓口
+                    HatchElementBuilder.<TileEntitySmallWorkStation>builder()
+                        .atLeast(SmallWorkStationUtil.ProjectModuleElement.ProjectModule)
+                        .adder(TileEntitySmallWorkStation::addToMachineList)
+                        .hatchClass(TileEntitySmallWorkStationModuleBase.class)
+                        .hint(2)
+                        .casingIndex(CASING_INDEX_BASE)
+                        .build(),
+                    // 模块位置的基础外壳
+                    StructureUtility.ofBlock(GregTechAPI.sBlockCasingsSE, 0)))
+            .build();
+    // spotless:on
+
+    // ==================== 构造函数 ====================
+
+    /**
+     * 创建新的小型工作站控制器
+     *
+     * @param id           控制器的 ID
+     * @param name         控制器的名称
+     * @param regionalName 控制器的本地化名称
+     */
+    public TileEntitySmallWorkStation(int id, String name, String regionalName) {
+        super(id, name, regionalName);
+    }
+
+    /**
+     * 创建新的小型工作站控制器（使用名称构造）
+     *
+     * @param name 控制器的名称
+     */
+    public TileEntitySmallWorkStation(String name) {
+        super(name);
+    }
+
+    // ==================== 结构构建 ====================
+
+    /**
+     * 在创造模式下构建小型工作站结构
+     * 构建 9×1×9 的平面主体，控制器位于中心
+     *
+     * @param stackSize 全息投影仪物品堆
+     * @param hintsOnly 是否仅显示提示
+     */
+    @Override
+    public void construct(ItemStack stackSize, boolean hintsOnly) {
+        // 构建主结构：9×1×9 平面，控制器偏移 (4, 0, 4) 使其位于中心
+        buildPiece(
+            STRUCTURE_PIECE_MAIN,
+            stackSize,
+            hintsOnly,
+            STRUCTURE_OFFSET_X,
+            STRUCTURE_OFFSET_Y,
+            STRUCTURE_OFFSET_Z);
+    }
+
+    /**
+     * 在生存模式下构建小型工作站结构
+     *
+     * @param stack         物品堆
+     * @param elementBudget 元素预算
+     * @param env           生存构建环境
+     * @return 构建结果
+     */
+    @Override
+    public int survivalConstruct(ItemStack stack, int elementBudget, ISurvivalBuildEnvironment env) {
+        if (mMachine) return -1;
+        // 构建主结构
+        return survivalBuildPiece(
+            STRUCTURE_PIECE_MAIN,
+            stack,
+            STRUCTURE_OFFSET_X,
+            STRUCTURE_OFFSET_Y,
+            STRUCTURE_OFFSET_Z,
+            elementBudget,
+            env,
+            false,
+            true);
+    }
+
+    // ==================== 结构检查 ====================
+
+    /**
+     * 检查小型工作站结构是否有效
+     * 先检查 9×1×9 平面主体，再验证四个角的模块结构
+     *
+     * @param aBaseMetaTileEntity 此控制器的 MTE
+     * @param aStack              物品堆
+     * @param errors              结构错误列表
+     */
+    @Override
+    public void checkMachine(IGregTechTileEntity aBaseMetaTileEntity, ItemStack aStack, List<StructureError> errors) {
+        // 重置所有模块的连接状态
+        for (TileEntitySmallWorkStationModuleBase module : mProjectModuleHatches) {
+            module.disconnect();
+        }
+        mProjectModuleHatches.clear();
+
+        // 检查 9×1×9 平面主结构
+        checkPiece(
+            STRUCTURE_PIECE_MAIN,
+            STRUCTURE_OFFSET_X,
+            STRUCTURE_OFFSET_Y,
+            STRUCTURE_OFFSET_Z,
+            errors);
+
+        // 如果主结构检查有错误，不再继续检查模块
+        if (!errors.isEmpty()) {
+            return;
+        }
+
+        // 检查模块数量是否超过当前电机层级允许的上限
+        int maxSlots = SmallWorkStationUtil.getModuleSlotsUnlocked(motorTier);
+        if (mProjectModuleHatches.size() > maxSlots) {
+            errors.add(
+                new StructureError(
+                    StructureErrors.INCORRECT_AMOUNT,
+                    "ig.smallworkstation.error.too_many_modules",
+                    mProjectModuleHatches.size(),
+                    maxSlots));
+        }
+    }
+
+    // ==================== MTE 创建 ====================
+
+    /**
+     * 获取新的元方块实体
+     *
+     * @param aBaseMetaTileEntity 基础 MTE
+     * @return 新的小型工作站控制器实例
+     */
+    @Override
+    public IMetaTileEntity newMetaEntity(IGregTechTileEntity aBaseMetaTileEntity) {
+        return new TileEntitySmallWorkStation(this.mName);
+    }
+
+    // ==================== 结构定义获取 ====================
+
+    /**
+     * 获取小型工作站的结构定义
+     *
+     * @return 结构定义
+     */
+    @Override
+    public IStructureDefinition<? extends TTMultiblockBase> getStructure_EM() {
+        return STRUCTURE_DEFINITION;
+    }
+
+    // ==================== 对齐限制 ====================
+
+    /**
+     * 获取初始对齐限制
+     * 小型工作站只能水平放置，不能旋转或翻转
+     *
+     * @return 对齐限制
+     */
+    @Override
+    protected IAlignmentLimits getInitialAlignmentLimits() {
+        return (d, r, f) -> d.offsetY == 0 && r.isNotRotated() && !f.isVerticallyFliped();
+    }
+
+    // ==================== 模块管理方法 ====================
+
+    /**
+     * 将项目模块添加到机器列表中
+     * 模块会自动连接到当前小型工作站
+     *
+     * @param module 要添加的模块
+     * @return 始终返回 true
+     */
+    public boolean addProjectModuleToMachineList(IMetaTileEntity module) {
+        if (module instanceof TileEntitySmallWorkStationModuleBase) {
+            TileEntitySmallWorkStationModuleBase baseModule = (TileEntitySmallWorkStationModuleBase) module;
+            // 将模块连接到当前小型工作站
+            baseModule.connect(this);
+            return mProjectModuleHatches.add(baseModule);
+        }
+        return false;
+    }
+
+    // ==================== Tick 处理 ====================
+
+    /**
+     * 每 tick 后执行的回调
+     * 处理模块充能和状态更新
+     *
+     * @param aBaseMetaTileEntity 此控制器的 MTE
+     * @param aTick               当前 tick
+     */
+    @Override
+    public void onPostTick(IGregTechTileEntity aBaseMetaTileEntity, long aTick) {
+        super.onPostTick(aBaseMetaTileEntity, aTick);
+
+        if (aBaseMetaTileEntity.isServerSide()) {
+            // 按间隔为模块充能
+            if (aTick % MODULE_CHARGE_INTERVAL == 0) {
+                chargeModules();
+            }
+        }
+    }
+
+    /**
+     * 为所有已连接的模块分配能量
+     * 能量从小型工作站的内部缓冲中均匀分配给各模块
+     */
+    private void chargeModules() {
+        if (mProjectModuleHatches.isEmpty()) {
+            return;
+        }
+
+        // 统计需要充能的活跃模块数量
+        List<TileEntitySmallWorkStationModuleBase> activeModules = new ArrayList<>();
+        for (TileEntitySmallWorkStationModuleBase module : mProjectModuleHatches) {
+            if (module.isConnected() && module.getBaseMetaTileEntity() != null) {
+                activeModules.add(module);
+            }
+        }
+
+        if (activeModules.isEmpty()) {
+            return;
+        }
+
+        // 计算每个模块可分配的能量
+        long totalStoredEU = getBaseMetaTileEntity().getStoredEU();
+        long euPerModule = totalStoredEU / activeModules.size();
+
+        // 为每个模块分配能量
+        for (TileEntitySmallWorkStationModuleBase module : activeModules) {
+            if (euPerModule > 0) {
+                long used = module.increaseStoredEU(euPerModule);
+                // 从小型工作站缓冲中扣除已分配的能量
+                getBaseMetaTileEntity().decreaseStoredEnergyUnits(used, false);
+            }
+        }
+    }
+
+    // ==================== 配方检查 ====================
+
+    /**
+     * 检查小型工作站是否可以处理配方
+     * 小型工作站本身不执行配方，配方由各模块独立处理
+     *
+     * @return 配方检查结果
+     */
+    @Override
+    public @NotNull CheckRecipeResult checkProcessing_EM() {
+        // 小型工作站本身不执行配方，配方由各模块独立处理
+        return CheckRecipeResultRegistry.NO_RECIPE;
+    }
+
+    // ==================== NBT 数据持久化 ====================
+
+    /**
+     * 将小型工作站数据保存到 NBT
+     *
+     * @param aNBT 要保存到的 NBT 标签
+     */
+    @Override
+    public void saveNBTData(NBTTagCompound aNBT) {
+        super.saveNBTData(aNBT);
+        // 保存电机层级
+        aNBT.setInteger("motorTier", motorTier);
+    }
+
+    /**
+     * 从 NBT 加载小型工作站数据
+     *
+     * @param aNBT 要加载的 NBT 标签
+     */
+    @Override
+    public void loadNBTData(NBTTagCompound aNBT) {
+        super.loadNBTData(aNBT);
+        // 加载电机层级
+        motorTier = aNBT.getInteger("motorTier");
+    }
+
+    // ==================== 工具提示 ====================
+
+    /**
+     * 创建小型工作站的工具提示
+     *
+     * @return 工具提示构建器
+     */
+    @Override
+    protected MultiblockTooltipBuilder createTooltip() {
+        final MultiblockTooltipBuilder tt = new MultiblockTooltipBuilder();
+        tt.addMachineType(GTUtility.translate("gt.blockmachines.multimachine.ig.smallworkstation.type"))
+            .addInfo(GTUtility.translate("gt.blockmachines.multimachine.ig.smallworkstation.desc1"))
+            .addInfo(GTUtility.translate("gt.blockmachines.multimachine.ig.smallworkstation.desc2"))
+            .addInfo(GTUtility.translate("gt.blockmachines.multimachine.ig.smallworkstation.desc3"))
+            .addSeparator()
+            .addInfo(GTUtility.translate("gt.blockmachines.multimachine.ig.smallworkstation.moduleInfo"))
+            .addInfo(GTUtility.translate("gt.blockmachines.multimachine.ig.smallworkstation.moduleSlots"))
+            .beginStructureBlock(9, 1, 9, false)
+            .addController(GTUtility.translate("ig.smallworkstation.structure.ControllerPos"))
+            .addOtherStructurePart(
+                GTUtility.translate("ig.smallworkstation.structure.BaseCasing"),
+                GTUtility.translate("ig.smallworkstation.structure.CasingDesc"))
+            .addOtherStructurePart(
+                GTUtility.translate("ig.smallworkstation.structure.ModuleSlot"),
+                GTUtility.translate("ig.smallworkstation.structure.ModuleSlotDesc"))
+            .addEnergyHatch(GTUtility.translate("ig.smallworkstation.structure.AnyBaseCasing"), 1)
+            .addMaintenanceHatch(GTUtility.translate("ig.smallworkstation.structure.AnyBaseCasing"), 1)
+            .addInputBus(GTUtility.translate("ig.smallworkstation.structure.AnyBaseCasing"), 1)
+            .addOutputHatch(GTUtility.translate("ig.smallworkstation.structure.AnyBaseCasing"), 1)
+            .toolTipFinisher();
+        return tt;
+    }
+
+    // ==================== 纹理 ====================
+
+    /**
+     * 获取小型工作站的纹理
+     *
+     * @param aBaseMetaTileEntity 此控制器的 MTE
+     * @param side                要获取纹理的面
+     * @param facing              控制器的朝向
+     * @param colorIndex          颜色索引
+     * @param aActive             控制器是否激活
+     * @param aRedstone           是否有红石信号
+     * @return 纹理数组
+     */
+    @Override
+    public ITexture[] getTexture(IGregTechTileEntity aBaseMetaTileEntity, ForgeDirection side, ForgeDirection facing,
+        int colorIndex, boolean aActive, boolean aRedstone) {
+        if (side == facing) {
+            // 正面显示屏幕纹理
+            return new ITexture[] {
+                Textures.BlockIcons.getCasingTextureForId(CASING_INDEX_BASE),
+                new TTRenderedExtendedFacingTexture(aActive ? ScreenON : ScreenOFF)
+            };
+        }
+        return new ITexture[] { Textures.BlockIcons.getCasingTextureForId(CASING_INDEX_BASE) };
+    }
+
+    // ==================== GUI ====================
+
+    /**
+     * 构建小型工作站的 GUI
+     *
+     * @param builder     模块化窗口构建器
+     * @param buildContext UI 构建上下文
+     */
+    @Override
+    protected void addUIWidgets(ModularWindow.Builder builder, UIBuildContext buildContext) {
+        super.addUIWidgets(builder, buildContext);
+
+        // 添加 Logo
+        builder.widget(
+            new DrawableWidget().setDrawable(IG_UITextures.PICTURE_ELEVATOR_LOGO_DARK)
+                .setSize(18, 18)
+                .setPos(173, 74));
+
+        // 添加模块槽位信息显示
+        builder.widget(
+            new TextWidget(
+                StatCollector.translateToLocal("ig.smallworkstation.gui.moduleSlots") + ": "
+                    + SmallWorkStationUtil.getModuleSlotsUnlocked(motorTier) + " / 4")
+                        .setDefaultColor(COLOR_TEXT_WHITE.get())
+                        .setPos(10, 10));
+
+        // 添加贡献者按钮
+        addContributorsButton(builder);
+    }
+
+    /**
+     * 添加贡献者信息按钮
+     *
+     * @param builder 模块化窗口构建器
+     */
+    private void addContributorsButton(ModularWindow.Builder builder) {
+        builder.widget(
+            new ButtonWidget().setOnClick((clickData, widget) -> {
+                if (!widget.isClient()) {
+                    widget.getContext()
+                        .openChildWindow(CONTRIBUTORS_WINDOW_ID);
+                }
+            })
+                .setPlayClickSound(true)
+                .setBackground(GTUITextures.BUTTON_STANDARD_INFO)
+                .setPos(154, 74)
+                .setSize(16, 16)
+                .addTooltip(StatCollector.translateToLocal("ig.smallworkstation.gui.contributors"))
+                .setTooltipShowUpDelay(TOOLTIP_DELAY));
+    }
+
+    /**
+     * 创建子窗口（包括贡献者窗口）
+     *
+     * @param player        玩家实体
+     * @param buildContext  UI 构建上下文
+     * @return 子窗口
+     */
+    @Override
+    protected ModularWindow createWindow(EntityPlayer player, UIBuildContext buildContext) {
+        if (buildContext.getWindowId() == CONTRIBUTORS_WINDOW_ID) {
+            return createContributorsWindow(player);
+        }
+        return super.createWindow(player, buildContext);
+    }
+
+    /**
+     * 创建贡献者信息窗口
+     *
+     * @param player 玩家实体
+     * @return 贡献者窗口
+     */
+    private ModularWindow createContributorsWindow(EntityPlayer player) {
+        DynamicPositionedColumn texts = new DynamicPositionedColumn();
+        texts.setSynced(false)
+            .setSpace(0)
+            .setPos(5, 7);
+
+        // 设计团队
+        texts.widget(
+            new TextWidget(StatCollector.translateToLocal("ig.structure.design"))
+                .setDefaultColor(Color.PINK.normal));
+        texts.widget(new TextWidget("Small WorkStation Team").setDefaultColor(Color.GRAY.bright(1)));
+
+        // 特别感谢
+        texts.widget(
+            new TextWidget(StatCollector.translateToLocal("ig.structure.specialThanks"))
+                .setDefaultColor(Color.PINK.normal));
+        texts.widget(new TextWidget("GTNH Community").setDefaultColor(Color.GRAY.bright(1)));
+
+        return ModularWindow.builder(120, 100)
+            .setBackground(TecTechUITextures.BACKGROUND_SCREEN_BLUE)
+            .widget(
+                ButtonWidget.closeWindowButton(true)
+                    .setPos(100, 7))
+            .widget(texts)
+            .build();
+    }
+
+    // ==================== 安全虚空按钮 ====================
+
+    /**
+     * 创建安全虚空按钮
+     * 小型工作站不提供虚空保护按钮
+     *
+     * @return null
+     */
+    @Override
+    protected ButtonWidget createSafeVoidButton() {
+        return null;
+    }
+
+    // ==================== 其他重写方法 ====================
+
+    /**
+     * 此机器在雨中会爆炸吗？
+     *
+     * @return false，小型工作站不会在雨中爆炸
+     */
+    @Override
+    public boolean willExplodeInRain() {
+        return false;
+    }
+
+    /**
+     * 是否支持单配方锁定
+     *
+     * @return false
+     */
+    @Override
+    public boolean supportsSingleRecipeLocking() {
+        return false;
+    }
+
+    /**
+     * 默认是否需要维护检查
+     *
+     * @return false
+     */
+    @Override
+    public boolean getDefaultHasMaintenanceChecks() {
+        return false;
+    }
+
+    /**
+     * 预览构建时的回调
+     *
+     * @param trigger 触发物品堆
+     */
+    @Override
+    public void onPreviewConstruct(@NotNull ItemStack trigger) {
+        // 小型工作站预览构建时的处理
+    }
+
+    /**
+     * 预览结构完成时的回调
+     *
+     * @param trigger 触发物品堆
+     */
+    @Override
+    public void onPreviewStructureComplete(@NotNull ItemStack trigger) {
+        // 小型工作站结构预览完成时的处理
+    }
+
+    // ==================== 信息数据 ====================
+
+    /**
+     * 获取小型工作站的信息数据（用于信息面板）
+     *
+     * @return 信息数据字符串数组
+     */
+    @Override
+    public String[] getInfoData() {
+        return new String[] {
+            "Small WorkStation Operational Data:",
+            "Motor Tier: " + motorTier,
+            "Module Slots: " + SmallWorkStationUtil.getModuleSlotsUnlocked(motorTier) + " / 4",
+            "Installed Modules: " + mProjectModuleHatches.size(),
+            "Energy Stored: " + getBaseMetaTileEntity().getStoredEU() + " EU",
+            "---------------------------------------------"
+        };
+    }
+
+    /**
+     * 是否在 GUI 中显示配方文本
+     *
+     * @return false
+     */
+    @Override
+    public boolean showRecipeTextInGUI() {
+        return false;
+    }
+}

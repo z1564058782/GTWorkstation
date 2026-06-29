@@ -1,0 +1,459 @@
+/**
+ * 小型工作站模块基类
+ * 每个模块大小为 3x3x3，安装在小型工作站的四个角上
+ * 提供统一的能量管理、连接状态、GUI 基础等功能
+ *
+ * @author WorkStation Team
+ */
+public abstract class TileEntitySmallWorkStationModuleBase extends TTMultiblockBase implements ICasingTextureProvider {
+
+    /** 基础 EU 缓冲大小（UV 级别），用于计算不同电压层级的缓冲 */
+    protected static long EU_BUFFER_BASE_SIZE = 160008000L;
+    /** 此控制器实际的 EU 缓冲大小 */
+    protected final long euBufferSize;
+    /** 此控制器的电压层级，决定可执行的配方等级 */
+    protected final int tTier;
+    /** 此控制器的模块层级，决定可处理的配方复杂度 */
+    protected final int tModuleTier;
+    /** 运行此模块所需的最低电机层级 */
+    protected final int tMinMotorTier;
+    /** 标记模块是否已连接到小型工作站 */
+    protected boolean isConnected = false;
+
+    /** 输出参数：能量显示 */
+    Parameters.Group.ParameterOut energyDisplay;
+
+    /** 存储能量显示的名称 */
+    private static final INameFunction<TileEntitySmallWorkStationModuleBase> ENERGY_DISPLAY_NAME = (base, p) -> GTUtility
+        .translate("gt.blockmachines.multimachine.project.ig.cfgo.0"); // Stored Energy
+    /** 存储能量显示的状态 */
+    private static final IStatusFunction<TileEntitySmallWorkStationModuleBase> ENERGY_STATUS = (base, p) -> LedStatus
+        .fromLimitsInclusiveOuterBoundary(
+            p.get(),
+            1,
+            (double) base.maxEUStore() / 2D,
+            (double) base.maxEUStore() * 2D,
+            (double) base.maxEUStore() * 2D);
+
+    /** 主结构部件的名称 */
+    private static final String STRUCTURE_PIECE_MAIN = "main";
+    /**
+     * 小型模块的结构定义
+     * 每个模块为 3x3x3 的立方体结构
+     * 底部两层为仓口位置（H），顶部一层为控制器位置（~标记）
+     * 模块结构实际上是工作站整体结构的一部分，仅用于将总线和仓口映射到此模块
+     */
+    private static final IStructureDefinition<TileEntitySmallWorkStationModuleBase> STRUCTURE_DEFINITION = StructureDefinition
+        .<TileEntitySmallWorkStationModuleBase>builder()
+        .addShape(
+            STRUCTURE_PIECE_MAIN,
+            StructureUtility
+                .transpose(new String[][] {
+                    { "HHH", "HHH", "HHH" }, // 第 1 层（底部）：全部仓口位置
+                    { "HHH", "H~H", "HHH" }, // 第 2 层（中间）：控制器在中心，~ 标记
+                    { "HHH", "HHH", "HHH" }  // 第 3 层（顶部）：全部仓口位置
+                }))
+        .addElement(
+            'H',
+            GTStructureUtility.ofHatchAdderOptional(
+                TileEntitySmallWorkStationModuleBase::addClassicToMachineList,
+                TileEntitySmallWorkStation.CASING_INDEX_BASE,
+                1,
+                GregTechAPI.sBlockCasingsSE,
+                0))
+        .build();
+
+    /**
+     * 创建新的小型工作站模块基类
+     *
+     * @param aID           模块的 ID
+     * @param aName         模块的名称
+     * @param aNameRegional 模块的本地化名称
+     * @param tTier         电压层级
+     * @param tModuleTier   模块层级
+     * @param tMinMotorTier 最低所需电机层级
+     */
+    protected TileEntitySmallWorkStationModuleBase(int aID, String aName, String aNameRegional, int tTier,
+        int tModuleTier, int tMinMotorTier) {
+        super(aID, aName, aNameRegional);
+        this.tTier = tTier;
+        this.tModuleTier = tModuleTier;
+        this.tMinMotorTier = tMinMotorTier;
+        // 根据电压层级计算 EU 缓冲大小：基础大小 * 2^(tier-7)
+        euBufferSize = EU_BUFFER_BASE_SIZE * (2L << (tTier - 7));
+        useLongPower = true;
+    }
+
+    /**
+     * 创建新的小型工作站模块基类（使用名称构造）
+     *
+     * @param aName         模块的名称
+     * @param tTier         电压层级
+     * @param tModuleTier   模块层级
+     * @param tMinMotorTier 最低所需电机层级
+     */
+    protected TileEntitySmallWorkStationModuleBase(String aName, int tTier, int tModuleTier, int tMinMotorTier) {
+        super(aName);
+        this.tTier = tTier;
+        this.tModuleTier = tModuleTier;
+        this.tMinMotorTier = tMinMotorTier;
+        euBufferSize = EU_BUFFER_BASE_SIZE * (2L << (tTier - 7));
+        useLongPower = true;
+    }
+
+    /**
+     * 每 tick 后执行的回调
+     * 仅在连接到小型工作站时执行父类的逻辑
+     *
+     * @param aBaseMetaTileEntity 此控制器的 MTE
+     * @param aTick               当前 tick
+     */
+    @Override
+    public void onPostTick(IGregTechTileEntity aBaseMetaTileEntity, long aTick) {
+        if (aBaseMetaTileEntity.isServerSide() && isConnected) {
+            super.onPostTick(aBaseMetaTileEntity, aTick);
+            // 每 400 tick 修复所有维护问题
+            if (aTick % 400 == 0) fixAllIssues();
+            // 每 20 tick 更新能量显示
+            if (aTick % 20 == 0) energyDisplay.set(getEUVar());
+            // 确保效率不为负
+            if (mEfficiency < 0) mEfficiency = 0;
+            // 如果能量耗尽且正在处理，停止机器
+            if (aBaseMetaTileEntity.getStoredEU() <= 0 && mMaxProgresstime > 0) {
+                stopMachine(ShutDownReasonRegistry.POWER_LOSS);
+            }
+        }
+    }
+
+    /**
+     * 消耗能量输入
+     * 模块的能量来自小型工作站控制器的内部缓冲
+     *
+     * @param EUtEffective 有效电压
+     * @param Amperes      电流
+     * @return 如果能量足够则返回 true，否则返回 false
+     */
+    @Override
+    public boolean drainEnergyInput(long EUtEffective, long Amperes) {
+        long EUuse = EUtEffective * Amperes;
+        if (EUuse == 0L) {
+            return true;
+        } else {
+            // 确保 EU 使用量为正
+            if (EUuse < 0L) {
+                EUuse = -EUuse;
+            }
+            // 检查缓冲中是否有足够的能量
+            if (EUuse <= this.getEUVar()) {
+                this.setEUVar(this.getEUVar() - EUuse);
+                return true;
+            } else {
+                return false;
+            }
+        }
+    }
+
+    /**
+     * 模块没有维护问题，始终返回 true
+     *
+     * @return true
+     */
+    @Override
+    public boolean doRandomMaintenanceDamage() {
+        return true;
+    }
+
+    /**
+     * 获取此控制器可存储的最大 EU
+     *
+     * @return 最大 EU 存储量
+     */
+    @Override
+    public long maxEUStore() {
+        return euBufferSize;
+    }
+
+    /**
+     * 增加控制器缓冲中存储的 EU
+     *
+     * @param maximumIncrease 要增加到缓冲中的 EU 量
+     * @return 实际使用的 EU 量
+     */
+    public long increaseStoredEU(long maximumIncrease) {
+        if (getBaseMetaTileEntity() == null) {
+            return 0;
+        }
+        // 确保模块已连接到工作站
+        connect();
+        // 计算实际可增加的量（不超过剩余容量）
+        long increasedEU = Math
+            .min(getBaseMetaTileEntity().getEUCapacity() - getBaseMetaTileEntity().getStoredEU(), maximumIncrease);
+        return getBaseMetaTileEntity().increaseStoredEnergyUnits(increasedEU, false) ? increasedEU : 0;
+    }
+
+    /**
+     * 检查数据输入列表是否为空
+     *
+     * @return 如果数据输入列表为空则返回 true
+     */
+    public boolean isDataInputListEmpty() {
+        return eInputData.isEmpty();
+    }
+
+    /**
+     * 通知模块它已连接到小型工作站
+     */
+    public void connect() {
+        isConnected = true;
+    }
+
+    /** 父级小型工作站引用 */
+    TileEntitySmallWorkStation parent = null;
+
+    /**
+     * 通知模块它已连接到指定的小型工作站
+     *
+     * @param parent 父级小型工作站控制器
+     */
+    public void connect(TileEntitySmallWorkStation parent) {
+        this.parent = parent;
+        isConnected = true;
+    }
+
+    /**
+     * 通知模块它已与小型工作站断开连接
+     */
+    public void disconnect() {
+        this.parent = null;
+        isConnected = false;
+    }
+
+    /**
+     * 检查模块是否已连接到小型工作站
+     *
+     * @return 如果已连接则返回 true
+     */
+    public boolean isConnected() {
+        return isConnected;
+    }
+
+    /**
+     * 为控制器能量缓冲充电
+     * 模块不从外部获取能量，只从小型工作站控制器接收
+     *
+     * @param aBaseMetaTileEntity 此控制器的 MTE
+     */
+    @Override
+    protected void chargeController_EM(IGregTechTileEntity aBaseMetaTileEntity) {
+        // 不执行任何操作，模块仅从小型工作站控制器接收能量
+    }
+
+    /**
+     * 获取模块的电压层级
+     *
+     * @return 模块层级
+     */
+    public int getTier() {
+        return tTier;
+    }
+
+    /**
+     * 获取运行此模块所需的最低电机层级
+     *
+     * @return 最低电机层级
+     */
+    public int getNeededMotorTier() {
+        return tMinMotorTier;
+    }
+
+    /**
+     * 获取此模块可接受的最大输入电压
+     *
+     * @return 对应其层级的电压值
+     */
+    @Override
+    public long getMaxInputVoltage() {
+        return gregtech.api.enums.GTValues.V[tTier];
+    }
+
+    /**
+     * 获取此模块的结构定义
+     * 结构实际上是小型工作站的一部分，仅用于将总线和仓口映射到此模块
+     *
+     * @return 结构定义
+     */
+    @Override
+    public IStructureDefinition<? extends TTMultiblockBase> getStructure_EM() {
+        return STRUCTURE_DEFINITION;
+    }
+
+    /**
+     * 构建此模块的结构
+     *
+     * @param stackSize 全息投影仪物品堆
+     * @param hintsOnly 是否仅显示提示
+     */
+    @Override
+    public void construct(ItemStack stackSize, boolean hintsOnly) {
+        buildPiece(STRUCTURE_PIECE_MAIN, stackSize, hintsOnly, 1, 1, 1);
+    }
+
+    /**
+     * 在生存模式下构建此模块的结构
+     *
+     * @param stack         物品堆
+     * @param elementBudget 元素预算
+     * @param env           生存构建环境
+     * @return 构建结果
+     */
+    @Override
+    public int survivalConstruct(ItemStack stack, int elementBudget,
+        com.gtnewhorizon.structurelib.structure.ISurvivalBuildEnvironment env) {
+        if (mMachine) return -1;
+        return survivalBuildPiece(STRUCTURE_PIECE_MAIN, stack, 1, 1, 1, elementBudget, env, false, true);
+    }
+
+    /**
+     * 检查此模块的结构是否有效
+     *
+     * @param aBaseMetaTileEntity 此控制器的 MTE
+     * @param aStack              物品堆
+     * @param errors              结构错误列表
+     */
+    @Override
+    public void checkMachine(IGregTechTileEntity aBaseMetaTileEntity, ItemStack aStack, List<StructureError> errors) {
+        fixAllIssues();
+        checkPiece(STRUCTURE_PIECE_MAIN, 1, 1, 1, errors);
+    }
+
+    /**
+     * 此机器在雨中会爆炸吗？
+     *
+     * @return false，模块不会在雨中爆炸
+     */
+    @Override
+    public boolean willExplodeInRain() {
+        return false;
+    }
+
+    /**
+     * 获取 GUI 主题
+     *
+     * @return 星际标准主题
+     */
+    @Override
+    protected GTGuiTheme getGuiTheme() {
+        return GTGuiThemes.INTERGALACTIC_STANDARD;
+    }
+
+    /**
+     * 获取此模块的 GUI
+     *
+     * @return 模块基类 GUI
+     */
+    @Override
+    protected @NotNull MTEMultiBlockBaseGui<?> getGui() {
+        return new TileEntityModuleBaseGui<>(this);
+    }
+
+    /**
+     * 获取此控制器的纹理
+     *
+     * @param aBaseMetaTileEntity 此控制器的 MTE
+     * @param side                要获取纹理的面
+     * @param facing              控制器的朝向
+     * @param colorIndex          颜色索引
+     * @param aActive             控制器是否激活
+     * @param aRedstone           是否有红石信号
+     * @return 纹理数组
+     */
+    @Override
+    public ITexture[] getTexture(IGregTechTileEntity aBaseMetaTileEntity, ForgeDirection side, ForgeDirection facing,
+        int colorIndex, boolean aActive, boolean aRedstone) {
+        if (side == facing) {
+            // 正面显示屏幕纹理
+            return new ITexture[] { getCasingTexture(),
+                new TTRenderedExtendedFacingTexture(aActive ? TTMultiblockBase.ScreenON : TTMultiblockBase.ScreenOFF) };
+        }
+        return new ITexture[] { getCasingTexture() };
+    }
+
+    /**
+     * 获取外壳纹理
+     *
+     * @return 小型工作站基础外壳纹理
+     */
+    @Override
+    public ITexture getCasingTexture() {
+        return Textures.BlockIcons.getCasingTextureForId(TileEntitySmallWorkStation.CASING_INDEX_BASE);
+    }
+
+    /**
+     * 在 GUI 上添加 GregTech Logo
+     *
+     * @param builder 模块化窗口构建器
+     */
+    @Override
+    public void addGregTechLogo(ModularWindow.Builder builder) {
+        builder.widget(
+            new DrawableWidget().setDrawable(IG_UITextures.PICTURE_ELEVATOR_LOGO_DARK)
+                .setSize(18, 18)
+                .setPos(173, 74));
+    }
+
+    /**
+     * 在模块 GUI 上绘制文本信息
+     *
+     * @param screenElements 包含所有屏幕元素的列
+     * @param inventorySlot  控制器的物品栏槽位
+     */
+    @Override
+    protected void drawTexts(DynamicPositionedColumn screenElements, SlotWidget inventorySlot) {
+        screenElements.setSynced(false)
+            .setSpace(0);
+
+        // 结构不完整时显示提示
+        screenElements
+            .widget(
+                new TextWidget(GTUtility.trans("138", "Incomplete Structure.")).setDefaultColor(COLOR_TEXT_WHITE.get())
+                    .setEnabled(widget -> !mMachine))
+            .widget(new FakeSyncWidget.BooleanSyncer(() -> mMachine, val -> mMachine = val));
+
+        // 结构完整且就绪时显示
+        screenElements.widget(
+            new TextWidget(StatCollector.translateToLocal("gt.blockmachines.multimachine.ig.elevator.gui.ready"))
+                .setDefaultColor(COLOR_TEXT_WHITE.get())
+                .setEnabled(widget -> mMachine));
+
+        // 结构完整但没有配方时显示
+        screenElements.widget(
+            new TextWidget(StatCollector.translateToLocal("gt.blockmachines.multimachine.ig.elevator.gui.noRecipe"))
+                .setDefaultColor(COLOR_TEXT_WHITE.get())
+                .setEnabled(widget -> mMachine && !getBaseMetaTileEntity().isActive()));
+
+        // 结构完整且有配方正在运行时显示
+        screenElements.widget(
+            new TextWidget(StatCollector.translateToLocal("gt.blockmachines.multimachine.ig.elevator.gui.recipe"))
+                .setDefaultColor(COLOR_TEXT_WHITE.get())
+                .setEnabled(widget -> mMachine && getBaseMetaTileEntity().isActive()));
+    }
+
+    /**
+     * 实例化控制器的参数
+     */
+    @Override
+    protected void parametersInstantiation_EM() {
+        Parameters.Group hatch_0 = parametrization.getGroup(0, false);
+        energyDisplay = hatch_0.makeOutParameter(0, 0, ENERGY_DISPLAY_NAME, ENERGY_STATUS);
+    }
+
+    /**
+     * 模块默认不需要维护检查
+     *
+     * @return false
+     */
+    @Override
+    public boolean getDefaultHasMaintenanceChecks() {
+        return false;
+    }
+}
